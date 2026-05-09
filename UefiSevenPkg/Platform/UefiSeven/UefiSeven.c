@@ -39,6 +39,44 @@ CHAR16                      *mEfiFilePath         = NULL;
 EFI_FILE_HANDLE             mVolumeRoot           = NULL;
 EFI_FILE_HANDLE             mLogFileHandle        = NULL;
 
+STATIC
+UINT8
+LowBitIndex32 (
+  IN UINT32 Value
+  )
+{
+  UINT8  Index;
+
+  if (Value == 0) {
+    return 0;
+  }
+
+  Index = 0;
+  while ((Value & 1u) == 0) {
+    Value >>= 1;
+    Index++;
+  }
+
+  return Index;
+}
+
+STATIC
+UINT8
+BitCount32 (
+  IN UINT32 Value
+  )
+{
+  UINT8  Count;
+
+  Count = 0;
+  while (Value != 0) {
+    Value &= (Value - 1);
+    Count++;
+  }
+
+  return Count;
+}
+
 
 /**
   Fills in VESA-compatible information about supported video modes
@@ -67,6 +105,8 @@ ShimVesaInformation (
   UINT32                HorizontalOffsetPx;
   UINT32                VerticalOffsetPx;
   EFI_PHYSICAL_ADDRESS  FrameBufferBaseWithOffset;
+  UINT8                 BytesPerPixel;
+  UINT8                 BitsPerPixel;
 
   if ((StartAddress == 0) || (EndAddress == NULL)) {
     return EFI_INVALID_PARAMETER;
@@ -133,11 +173,44 @@ ShimVesaInformation (
   //
   // Center visible image on screen using framebuffer offset.
   //
-  HorizontalOffsetPx        = (mDisplayInfo.HorizontalResolution - 1024) / 2;
-  VerticalOffsetPx          = (mDisplayInfo.VerticalResolution - 768) / 2 * mDisplayInfo.PixelsPerScanLine;
+  if (mDisplayInfo.HorizontalResolution >= 1024) {
+    HorizontalOffsetPx = (mDisplayInfo.HorizontalResolution - 1024) / 2;
+  } else {
+    HorizontalOffsetPx = 0;
+  }
+
+  if (mDisplayInfo.VerticalResolution >= 768) {
+    VerticalOffsetPx = (mDisplayInfo.VerticalResolution - 768) / 2 * mDisplayInfo.PixelsPerScanLine;
+  } else {
+    VerticalOffsetPx = 0;
+  }
+  BytesPerPixel = 4;
+  BitsPerPixel  = 32;
+  if (mDisplayInfo.PixelFormat == PixelBitMask) {
+    UINT8  TotalMaskBits;
+
+    TotalMaskBits = BitCount32 (mDisplayInfo.PixelInformation.RedMask)
+                    + BitCount32 (mDisplayInfo.PixelInformation.GreenMask)
+                    + BitCount32 (mDisplayInfo.PixelInformation.BlueMask)
+                    + BitCount32 (mDisplayInfo.PixelInformation.ReservedMask);
+    if (TotalMaskBits != 0) {
+      BytesPerPixel = (UINT8)((TotalMaskBits + 7) / 8);
+      if (BytesPerPixel == 0) {
+        BytesPerPixel = 4;
+      }
+      BitsPerPixel = (UINT8)(BytesPerPixel * 8);
+    }
+  }
+
   FrameBufferBaseWithOffset = mDisplayInfo.FrameBufferBase
-                                + VerticalOffsetPx * 4      // 4 bytes per pixel
-                                + HorizontalOffsetPx * 4;   // 4 bytes per pixel
+                                + (EFI_PHYSICAL_ADDRESS)VerticalOffsetPx * BytesPerPixel
+                                + (EFI_PHYSICAL_ADDRESS)HorizontalOffsetPx * BytesPerPixel;
+
+  if (FrameBufferBaseWithOffset > MAX_UINT32) {
+    PrintError (L"Framebuffer address above 4GB (%lx), cannot report 32-bit VBE LFB address\n", FrameBufferBaseWithOffset);
+    PrintError (L"Try disabling 'Above 4G Decoding' / 'Resizable BAR' in firmware setup.\n");
+    return EFI_UNSUPPORTED;
+  }
 
   //
   // Memory access (banking, windowing, paging).
@@ -145,7 +218,7 @@ ShimVesaInformation (
   VbeModeInfo->NumBanks                 = 1;      // disable memory banking
   VbeModeInfo->BankSizeKB               = 0;      // disable memory banking
   VbeModeInfo->LfbAddress               = (UINT32)FrameBufferBaseWithOffset;            // 32-bit physical address
-  VbeModeInfo->BytesPerScanLineLinear   = (UINT16)mDisplayInfo.PixelsPerScanLine * 4;   // logical bytes in linear modes
+  VbeModeInfo->BytesPerScanLineLinear   = (UINT16)mDisplayInfo.PixelsPerScanLine * BytesPerPixel;   // logical bytes in linear modes
   VbeModeInfo->NumImagePagesLessOne     = 0;      // disable image paging
   VbeModeInfo->NumImagesLessOneLinear   = 0;      // disable image paging
   VbeModeInfo->WindowPositioningAddress = 0x0;    // force windowing to Function 5h
@@ -162,7 +235,7 @@ ShimVesaInformation (
   VbeModeInfo->NumPlanes                = 1;      // packed pixel mode
   VbeModeInfo->MemoryModel              = 6;      // Direct Color
   VbeModeInfo->DirectColorModeInfo      = BIT1;   // alpha bytes may be used by application
-  VbeModeInfo->BitsPerPixel             = 32;     // 8+8+8+8 bits per channel
+  VbeModeInfo->BitsPerPixel             = BitsPerPixel;
   VbeModeInfo->BlueMaskSizeLinear       = 8;
   VbeModeInfo->GreenMaskSizeLinear      = 8;
   VbeModeInfo->RedMaskSizeLinear        = 8;
@@ -178,6 +251,24 @@ ShimVesaInformation (
     VbeModeInfo->GreenMaskPosLinear     = 8;      // green offset
     VbeModeInfo->BlueMaskPosLinear      = 16;     // blue offset
     VbeModeInfo->ReservedMaskPosLinear  = 24;     // alpha offset
+  } else if (mDisplayInfo.PixelFormat == PixelBitMask) {
+    EFI_PIXEL_BITMASK  *Masks;
+
+    Masks = &mDisplayInfo.PixelInformation;
+    if ((Masks->RedMask == 0) || (Masks->GreenMask == 0) || (Masks->BlueMask == 0)) {
+      PrintError (L"Unsupported PixelBitMask (missing RGB masks), aborting\n");
+      return EFI_UNSUPPORTED;
+    }
+
+    VbeModeInfo->RedMaskSizeLinear      = BitCount32 (Masks->RedMask);
+    VbeModeInfo->GreenMaskSizeLinear    = BitCount32 (Masks->GreenMask);
+    VbeModeInfo->BlueMaskSizeLinear     = BitCount32 (Masks->BlueMask);
+    VbeModeInfo->ReservedMaskSizeLinear = BitCount32 (Masks->ReservedMask);
+
+    VbeModeInfo->RedMaskPosLinear       = LowBitIndex32 (Masks->RedMask);
+    VbeModeInfo->GreenMaskPosLinear     = LowBitIndex32 (Masks->GreenMask);
+    VbeModeInfo->BlueMaskPosLinear      = LowBitIndex32 (Masks->BlueMask);
+    VbeModeInfo->ReservedMaskPosLinear  = LowBitIndex32 (Masks->ReservedMask);
   } else {
     PrintError (L"Unsupported value of PixelFormat (%d), aborting\n", mDisplayInfo.PixelFormat);
     return EFI_UNSUPPORTED;
@@ -567,6 +658,58 @@ WaitForEnterAndStall (
   gBS->Stall (1000 * 1000); // 1 second
 }
 
+STATIC
+BOOLEAN
+AsciiEqualsIgnoreCaseN (
+  IN CONST CHAR8  *Left,
+  IN UINTN        LeftLen,
+  IN CONST CHAR8  *Right
+  )
+{
+  UINTN  i;
+
+  for (i = 0; i < LeftLen; i++) {
+    CHAR8  A;
+    CHAR8  B;
+
+    A = Left[i];
+    B = Right[i];
+    if ((A >= 'A') && (A <= 'Z')) {
+      A = (CHAR8)(A - 'A' + 'a');
+    }
+    if ((B >= 'A') && (B <= 'Z')) {
+      B = (CHAR8)(B - 'A' + 'a');
+    }
+    if (A != B) {
+      return FALSE;
+    }
+  }
+
+  return Right[LeftLen] == '\0';
+}
+
+STATIC
+VOID
+ApplyConfigKey (
+  IN CONST CHAR8  *Key,
+  IN UINTN        KeyLen,
+  IN UINTN        Value
+  )
+{
+  BOOLEAN  Enabled;
+
+  Enabled = (Value == 1);
+  if (AsciiEqualsIgnoreCaseN (Key, KeyLen, "skiperrors")) {
+    mSkipErrors = Enabled;
+  } else if (AsciiEqualsIgnoreCaseN (Key, KeyLen, "force_fakevesa")) {
+    mForceFakeVesa = Enabled;
+  } else if (AsciiEqualsIgnoreCaseN (Key, KeyLen, "verbose")) {
+    mVerboseMode = Enabled;
+  } else if (AsciiEqualsIgnoreCaseN (Key, KeyLen, "logfile")) {
+    mLogToFile = Enabled;
+  }
+}
+
 
 BOOLEAN
 ReadConfig (
@@ -575,10 +718,10 @@ ReadConfig (
 {
   EFI_STATUS  Status;
   CHAR16      *FilePath = NULL;
-  UINT8       *FileContents;
-  UINTN       FileBytes;
-  VOID        *Context;
-  UINTN       Num;
+  UINT8       *FileContents = NULL;
+  UINTN       FileBytes = 0;
+  BOOLEAN     InConfigSection;
+  UINTN       Index;
 
   if (mEfiFilePath == NULL) {
     return FALSE;
@@ -606,39 +749,104 @@ ReadConfig (
     return FALSE;
   }
 
-  Context = OpenIniFile (FileContents, FileBytes);
-  if (Context == NULL) {
-    return FALSE;
+  //
+  // Minimal INI parser: only [config] section, decimal values.
+  //
+  InConfigSection = FALSE;
+  Index = 0;
+  while (Index < FileBytes) {
+    UINTN  LineStart;
+    UINTN  LineEnd;
+    UINTN  Start;
+
+    LineStart = Index;
+    while ((LineStart < FileBytes) && ((FileContents[LineStart] == '\n') || (FileContents[LineStart] == '\r'))) {
+      LineStart++;
+    }
+    LineEnd = LineStart;
+    while ((LineEnd < FileBytes) && (FileContents[LineEnd] != '\n') && (FileContents[LineEnd] != '\r')) {
+      LineEnd++;
+    }
+    Index = LineEnd;
+
+    // Trim leading whitespace.
+    Start = LineStart;
+    while ((Start < LineEnd) && ((FileContents[Start] == ' ') || (FileContents[Start] == '\t'))) {
+      Start++;
+    }
+    if (Start >= LineEnd) {
+      continue;
+    }
+
+    // Comment line?
+    if ((FileContents[Start] == ';') || (FileContents[Start] == '#')) {
+      continue;
+    }
+
+    // Section?
+    if (FileContents[Start] == '[') {
+      UINTN  NameStart;
+      UINTN  NameEnd;
+
+      NameStart = Start + 1;
+      NameEnd = NameStart;
+      while ((NameEnd < LineEnd) && (FileContents[NameEnd] != ']')) {
+        NameEnd++;
+      }
+      InConfigSection = FALSE;
+      if ((NameEnd < LineEnd) && (FileContents[NameEnd] == ']')) {
+        if (AsciiEqualsIgnoreCaseN ((CONST CHAR8 *)&FileContents[NameStart], NameEnd - NameStart, "config")) {
+          InConfigSection = TRUE;
+        }
+      }
+      continue;
+    }
+
+    if (!InConfigSection) {
+      continue;
+    }
+
+    // key=value
+    {
+      UINTN  Eq;
+      UINTN  KeyStart;
+      UINTN  KeyEnd;
+      UINTN  ValStart;
+      UINTN  Value;
+
+      Eq = Start;
+      while ((Eq < LineEnd) && (FileContents[Eq] != '=')) {
+        Eq++;
+      }
+      if (Eq >= LineEnd) {
+        continue;
+      }
+
+      KeyStart = Start;
+      KeyEnd = Eq;
+      while ((KeyEnd > KeyStart) && ((FileContents[KeyEnd - 1] == ' ') || (FileContents[KeyEnd - 1] == '\t'))) {
+        KeyEnd--;
+      }
+      if (KeyEnd <= KeyStart) {
+        continue;
+      }
+
+      ValStart = Eq + 1;
+      while ((ValStart < LineEnd) && ((FileContents[ValStart] == ' ') || (FileContents[ValStart] == '\t'))) {
+        ValStart++;
+      }
+
+      Value = 0;
+      while ((ValStart < LineEnd) && (FileContents[ValStart] >= '0') && (FileContents[ValStart] <= '9')) {
+        Value = (Value * 10) + (FileContents[ValStart] - '0');
+        ValStart++;
+      }
+
+      ApplyConfigKey ((CONST CHAR8 *)&FileContents[KeyStart], KeyEnd - KeyStart, Value);
+    }
   }
 
-  //
-  // Check if we should skip warnings and prompts
-  //
-  Status          = GetDecimalUintnFromDataFile (Context, "config", "skiperrors", &Num);
-  mSkipErrors     = (!EFI_ERROR (Status) && (Num == 1));
-
-  //
-  // Check if we should force fakevesa
-  //
-  Status          = GetDecimalUintnFromDataFile (Context, "config", "force_fakevesa", &Num);
-  mForceFakeVesa  = (!EFI_ERROR (Status) && (Num == 1));
-
-  //
-  // Check if we should run in verbose mode
-  //
-  Status          = GetDecimalUintnFromDataFile (Context, "config", "verbose", &Num);
-  mVerboseMode    = (!EFI_ERROR (Status) && (Num == 1));
-
-  //
-  // Check if we should log to file
-  //
-  Status          = GetDecimalUintnFromDataFile (Context, "config", "logfile", &Num);
-  mLogToFile      = (!EFI_ERROR (Status) && (Num == 1));
-
-  CloseIniFile (Context);
-
   FreePool (FileContents);
-
   return TRUE;
 }
 
@@ -808,6 +1016,7 @@ UefiMain (
   // Windows 7 prefers a 1024x768 resolution.
   //
   SwitchVideoMode (1024, 768);
+  InstallDisplayExitBootServicesNotifications ();
   if (mVerboseMode || mLogToFile) {
     PrintVideoInfo ();
   }
@@ -885,11 +1094,17 @@ UefiMain (
   // Try to point the Int10h vector at shim entry point.
   //
   IvtInt10hHandlerEntry = (IVT_ENTRY *)IVT_ADDRESS + 0x10;
+  PrintDebug (L"Current Int10h IVT entry = %04x:%04x (phys=%x)\n",
+    IvtInt10hHandlerEntry->Segment,
+    IvtInt10hHandlerEntry->Offset,
+    (EFI_PHYSICAL_ADDRESS)((IvtInt10hHandlerEntry->Segment << 4) + IvtInt10hHandlerEntry->Offset));
   if (!EFI_ERROR (IvtAllocationStatus)) {
     IvtInt10hHandlerEntry->Segment = NewInt10hHandlerEntry.Segment;
     IvtInt10hHandlerEntry->Offset = NewInt10hHandlerEntry.Offset;
     PrintDebug (L"Int10h IVT entry modified to point at %04x:%04x\n",
       IvtInt10hHandlerEntry->Segment, IvtInt10hHandlerEntry->Offset);
+    PrintDebug (L"New Int10h handler phys=%x\n",
+      (EFI_PHYSICAL_ADDRESS)((IvtInt10hHandlerEntry->Segment << 4) + IvtInt10hHandlerEntry->Offset));
   } else if (IvtInt10hHandlerEntry->Segment == NewInt10hHandlerEntry.Segment
     && IvtInt10hHandlerEntry->Offset == NewInt10hHandlerEntry.Offset) {
     PrintDebug (L"Int10h IVT entry could not be modified but already pointing at %04x:%04x\n",
