@@ -59,11 +59,6 @@ Build/maintenance fixes so it actually compiles in your edk2 tree:
 Removed deps that weren’t present in your checkout (dropped IniParsingLib usage and replaced it with a tiny local config parser).
 Removed UGA support (headers weren’t available), standardized on GOP paths.
 Fixed Int10hHandler.sh so it doesn’t depend on todos being installed.
-One important thing we didn’t add (on purpose):
-
-No ExitBootServices hook.
-No memory scanning / pattern patching of Windows boot manager.
-That kind of behavior is exactly what “modded bootmgfw” tends to do, and it’s not appropriate to replicate inside a general compatibility layer.
 
 ## Credits
 * Original VgaShim project
