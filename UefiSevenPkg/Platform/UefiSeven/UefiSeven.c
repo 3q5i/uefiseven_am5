@@ -35,6 +35,7 @@ BOOLEAN                     mVerboseMode          = FALSE;
 BOOLEAN                     mSkipErrors           = FALSE;
 BOOLEAN                     mForceFakeVesa        = FALSE;
 BOOLEAN                     mLogToFile            = FALSE;
+BOOLEAN                     mPreferNativeRes      = FALSE;
 CHAR16                      *mEfiFilePath         = NULL;
 EFI_FILE_HANDLE             mVolumeRoot           = NULL;
 EFI_FILE_HANDLE             mLogFileHandle        = NULL;
@@ -121,6 +122,16 @@ ShimVesaInformation (
   }
 
   //
+  // If prefer_native_res is set, report the current mode directly. This avoids
+  // cases where Windows draws to a 1024x768 surface that the firmware/GPU then
+  // scales or stretches.
+  //
+  if (mPreferNativeRes) {
+    HorizontalOffsetPx = 0;
+    VerticalOffsetPx   = 0;
+  }
+
+  //
   // VESA general information.
   //
   VbeInfoFull = (VBE_INFO *)(UINTN)StartAddress;
@@ -165,24 +176,34 @@ ShimVesaInformation (
   //
   // Resolution.
   //
-  VbeModeInfo->Width                    = 1024;   // as expected by Windows installer
-  VbeModeInfo->Height                   = 768;    // as expected by Windows installer
+  if (mPreferNativeRes) {
+    VbeModeInfo->Width                  = (UINT16)mDisplayInfo.HorizontalResolution;
+    VbeModeInfo->Height                 = (UINT16)mDisplayInfo.VerticalResolution;
+  } else {
+    VbeModeInfo->Width                  = 1024;   // as expected by Windows installer
+    VbeModeInfo->Height                 = 768;    // as expected by Windows installer
+  }
   VbeModeInfo->CharCellWidth            = 8;      // used to calculate resolution in text modes
   VbeModeInfo->CharCellHeight           = 16;     // used to calculate resolution in text modes
 
   //
   // Center visible image on screen using framebuffer offset.
   //
-  if (mDisplayInfo.HorizontalResolution >= 1024) {
-    HorizontalOffsetPx = (mDisplayInfo.HorizontalResolution - 1024) / 2;
-  } else {
+  if (mPreferNativeRes) {
     HorizontalOffsetPx = 0;
-  }
-
-  if (mDisplayInfo.VerticalResolution >= 768) {
-    VerticalOffsetPx = (mDisplayInfo.VerticalResolution - 768) / 2 * mDisplayInfo.PixelsPerScanLine;
+    VerticalOffsetPx   = 0;
   } else {
-    VerticalOffsetPx = 0;
+    if (mDisplayInfo.HorizontalResolution >= 1024) {
+      HorizontalOffsetPx = (mDisplayInfo.HorizontalResolution - 1024) / 2;
+    } else {
+      HorizontalOffsetPx = 0;
+    }
+
+    if (mDisplayInfo.VerticalResolution >= 768) {
+      VerticalOffsetPx = (mDisplayInfo.VerticalResolution - 768) / 2 * mDisplayInfo.PixelsPerScanLine;
+    } else {
+      VerticalOffsetPx = 0;
+    }
   }
   BytesPerPixel = 4;
   BitsPerPixel  = 32;
@@ -707,6 +728,8 @@ ApplyConfigKey (
     mVerboseMode = Enabled;
   } else if (AsciiEqualsIgnoreCaseN (Key, KeyLen, "logfile")) {
     mLogToFile = Enabled;
+  } else if (AsciiEqualsIgnoreCaseN (Key, KeyLen, "prefer_native_res")) {
+    mPreferNativeRes = Enabled;
   }
 }
 
@@ -1015,13 +1038,17 @@ UefiMain (
   //
   // Windows 7 prefers a 1024x768 resolution.
   //
-  SwitchVideoMode (1024, 768);
+  if (!mPreferNativeRes) {
+    SwitchVideoMode (1024, 768);
+  } else {
+    PrintDebug (L"prefer_native_res enabled; keeping current GOP mode\n");
+  }
   InstallDisplayExitBootServicesNotifications ();
   if (mVerboseMode || mLogToFile) {
     PrintVideoInfo ();
   }
 
-  if (!MatchCurrentResolution (1024, 768)) {
+  if (!mPreferNativeRes && !MatchCurrentResolution (1024, 768)) {
     PrintError (L"Current display does not seem to support changing to 1024x768 resolution\n");
     PrintError (L"which is the minimum requirement of Windows 7.\n");
     PrintError (L"It is likely that Windows might fail to boot even with the handler installed.\n");
