@@ -83,4 +83,13 @@ cut -c 11-28 -- "$STEM".disasm \
   printf '};\n'
   printf '#endif\n'
 } \
-| todos >"$STEM".h
+| {
+  if command -v todos >/dev/null 2>&1; then
+    todos
+  elif command -v unix2dos >/dev/null 2>&1; then
+    unix2dos
+  else
+    # Fallback: convert LF to CRLF without external dependencies.
+    perl -pe 's/\n/\r\n/g'
+  fi
+} >"$STEM".h
