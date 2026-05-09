@@ -35,14 +35,12 @@
   MdeModulePkg/MdeModulePkg.dec
   MdePkg/MdePkg.dec
   OvmfPkg/OvmfPkg.dec
-  SignedCapsulePkg/SignedCapsulePkg.dec
   UefiCpuPkg/UefiCpuPkg.dec
   UefiSevenPkg/UefiSevenPkg.dec
 
 [LibraryClasses]
   BaseMemoryLib
   DevicePathLib
-  IniParsingLib
   IoLib
   MemoryAllocationLib
   MtrrLib
@@ -55,6 +53,7 @@
 
 [Guids]
   gEfiFileInfoGuid
+  gEfiEventExitBootServicesGuid
   gBcdWindowsBootmgrGuid
 
 [Protocols]
