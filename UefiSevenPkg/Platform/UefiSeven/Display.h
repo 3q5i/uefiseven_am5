@@ -27,7 +27,6 @@
 
 #include <Protocol/GraphicsOutput.h>
 #include <Protocol/LoadedImage.h>
-#include <Protocol/UgaDraw.h>
 #include <Protocol/ConsoleControl.h>
 
 #include <Library/BaseMemoryLib.h>
@@ -45,13 +44,12 @@
 typedef struct {
   UINTN           Width;
   UINTN           Height;
-  EFI_UGA_PIXEL   *PixelData;
+  EFI_GRAPHICS_OUTPUT_BLT_PIXEL   *PixelData;
 } IMAGE;
 
 typedef enum {
   NONE,
-  GOP,
-  UGA
+  GOP
 } GRAPHICS_PROTOCOL;
 
 typedef struct {
@@ -59,12 +57,12 @@ typedef struct {
   BOOLEAN                       AdapterFound;
 
   GRAPHICS_PROTOCOL             Protocol;
-  EFI_UGA_DRAW_PROTOCOL         *UGA;
   EFI_GRAPHICS_OUTPUT_PROTOCOL  *GOP;
 
   UINT32                        HorizontalResolution;
   UINT32                        VerticalResolution;
   EFI_GRAPHICS_PIXEL_FORMAT     PixelFormat;
+  EFI_PIXEL_BITMASK             PixelInformation;
   UINT32                        PixelsPerScanLine;
   EFI_PHYSICAL_ADDRESS          FrameBufferBase;
   UINTN                         FrameBufferSize;
@@ -124,6 +122,11 @@ EFI_STATUS
 ForceVideoModeHack (
   IN UINTN  Width,
   IN UINTN  Height
+  );
+
+EFI_STATUS
+InstallDisplayExitBootServicesNotifications (
+  VOID
   );
 
 BOOLEAN
