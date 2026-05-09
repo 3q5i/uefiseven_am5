@@ -30,8 +30,43 @@ Refer to the sample configuration file for available options.
     make -C BaseTools/
     ./MdeModulePkg/Application/UefiSeven/Int10hHandler.sh ; Regenerate Int10h assembly. Optional
     build -a X64 -t GCC49 -b RELEASE -p UefiSevenPkg/UefiSevenPkg.dsc --conf=UefiSevenPkg/Conf
-    
+
+## What is added
+
+Better GOP compatibility for modern GPUs/firmware:
+
+Properly handles GOP PixelBitMask (not just the usual RGB/BGR formats).
+Dumps a lot more video diagnostics (all GOP modes, pixel formats/masks, framebuffer base/size, stride).
+Tries harder to avoid PixelBltOnly modes by switching to a real linear framebuffer mode when possible.
+Skips “bad for Win7” modes where the framebuffer base is above 4GB (Win7/VBE paths are very 32-bit-ish).
+Safer “force mode / fake mode info” behavior:
+
+If UefiSeven does the “force 1024x768” style hack, it now sanity-checks framebuffer sizing so it doesn’t create an overrun or impossible layout.
+If it can’t find a usable mode, it restores the original GOP mode instead of leaving things half-broken.
+Much more consistent VBE/Int10h reporting:
+
+VBE info now derives bpp/bytes-per-pixel from the actual GOP masks/format (especially for PixelBitMask) instead of assuming “32bpp always”.
+Logging for the Int10h vector install (so you can see what vector is present before/after UefiSeven installs its handler).
+Clean “ExitBootServices” cleanup without doing anything bootkit-like:
+
+We added an EVT_SIGNAL_EXIT_BOOT_SERVICES notification event (UEFI event) that restores any GOP “mode info edits” right before ExitBootServices, and logs that it did so.
+This is explicitly not an ExitBootServices hook, and it does not scan or patch bootmgfw in memory.
+“Disable boot stretching” option:
+
+Added a config flag prefer_native_res=1 so UefiSeven can stop forcing 1024x768 and instead report/use the native GOP resolution (helps with the ugly stretch / scaling behavior).
+Build/maintenance fixes so it actually compiles in your edk2 tree:
+
+Removed deps that weren’t present in your checkout (dropped IniParsingLib usage and replaced it with a tiny local config parser).
+Removed UGA support (headers weren’t available), standardized on GOP paths.
+Fixed Int10hHandler.sh so it doesn’t depend on todos being installed.
+One important thing we didn’t add (on purpose):
+
+No ExitBootServices hook.
+No memory scanning / pattern patching of Windows boot manager.
+That kind of behavior is exactly what “modded bootmgfw” tends to do, and it’s not appropriate to replicate inside a general compatibility layer.
+
 ## Credits
 * Original VgaShim project
 * OVMF project
 * EDK II project
+- Original UefiSeven project
