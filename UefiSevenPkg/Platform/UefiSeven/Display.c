@@ -15,6 +15,100 @@
 
 #include "Display.h"
 #include "Util.h"
+#include <Guid/EventGroup.h>
+
+STATIC
+CONST CHAR16 *
+PixelFormatToStr (
+  IN EFI_GRAPHICS_PIXEL_FORMAT PixelFormat
+  )
+{
+  switch (PixelFormat) {
+    case PixelRedGreenBlueReserved8BitPerColor:
+      return L"RGBR";
+    case PixelBlueGreenRedReserved8BitPerColor:
+      return L"BGRR";
+    case PixelBitMask:
+      return L"BitMask";
+    case PixelBltOnly:
+      return L"BltOnly";
+    default:
+      return L"Unknown";
+  }
+}
+
+typedef struct {
+  BOOLEAN                       Saved;
+  EFI_GRAPHICS_OUTPUT_PROTOCOL  *Gop;
+  UINT32                        HorizontalResolution;
+  UINT32                        VerticalResolution;
+  EFI_GRAPHICS_PIXEL_FORMAT     PixelFormat;
+  EFI_PIXEL_BITMASK             PixelInformation;
+  UINT32                        PixelsPerScanLine;
+  UINTN                         FrameBufferSize;
+} SAVED_GOP_MODE;
+
+STATIC SAVED_GOP_MODE  mSavedGopMode = { 0 };
+STATIC EFI_EVENT       mExitBootServicesEvent = NULL;
+
+STATIC
+VOID
+RestoreGopModeInfoIfSaved (
+  VOID
+  )
+{
+  if (!mSavedGopMode.Saved || (mSavedGopMode.Gop == NULL) || (mSavedGopMode.Gop->Mode == NULL)) {
+    return;
+  }
+
+  PrintDebug (L"Restoring GOP mode info before ExitBootServices\n");
+  mSavedGopMode.Gop->Mode->Info->HorizontalResolution = mSavedGopMode.HorizontalResolution;
+  mSavedGopMode.Gop->Mode->Info->VerticalResolution   = mSavedGopMode.VerticalResolution;
+  mSavedGopMode.Gop->Mode->Info->PixelFormat          = mSavedGopMode.PixelFormat;
+  mSavedGopMode.Gop->Mode->Info->PixelInformation     = mSavedGopMode.PixelInformation;
+  mSavedGopMode.Gop->Mode->Info->PixelsPerScanLine    = mSavedGopMode.PixelsPerScanLine;
+  mSavedGopMode.Gop->Mode->FrameBufferSize            = mSavedGopMode.FrameBufferSize;
+}
+
+STATIC
+VOID
+EFIAPI
+OnExitBootServices (
+  IN EFI_EVENT  Event,
+  IN VOID       *Context
+  )
+{
+  RestoreGopModeInfoIfSaved ();
+}
+
+EFI_STATUS
+InstallDisplayExitBootServicesNotifications (
+  VOID
+  )
+{
+  EFI_STATUS  Status;
+
+  if (mExitBootServicesEvent != NULL) {
+    return EFI_SUCCESS;
+  }
+
+  Status = gBS->CreateEventEx (
+                  EVT_NOTIFY_SIGNAL,
+                  TPL_CALLBACK,
+                  OnExitBootServices,
+                  NULL,
+                  &gEfiEventExitBootServicesGuid,
+                  &mExitBootServicesEvent
+                  );
+  if (EFI_ERROR (Status)) {
+    PrintDebug (L"Failed to register ExitBootServices notification (error: %r)\n", Status);
+    mExitBootServicesEvent = NULL;
+    return Status;
+  }
+
+  PrintDebug (L"Registered ExitBootServices notification\n");
+  return EFI_SUCCESS;
+}
 
 
 /**
@@ -44,8 +138,6 @@ InitializeDisplay (
   )
 {
   EFI_STATUS    Status;
-  UINT32        Temp1;
-  UINT32        Temp2;
 
   // Sets AdapterFound = FALSE and Protocol = NONE
   ZeroMem (&mDisplayInfo, sizeof (DISPLAY_INFO));
@@ -60,9 +152,44 @@ InitializeDisplay (
   if (!EFI_ERROR (Status)) {
     PrintDebug (L"Found a GOP display adapter\n");
 
+    if (mDisplayInfo.GOP->Mode->Info->PixelFormat == PixelBltOnly) {
+      UINT32                                MaxMode;
+      UINT32                                ModeIndex;
+      EFI_GRAPHICS_OUTPUT_MODE_INFORMATION  *ModeInfo;
+      UINTN                                 SizeOfInfo;
+
+      PrintDebug (L"Current GOP mode is PixelBltOnly; trying to switch to a linear framebuffer mode\n");
+      MaxMode = mDisplayInfo.GOP->Mode->MaxMode;
+      for (ModeIndex = 0; ModeIndex < MaxMode; ModeIndex++) {
+        Status = mDisplayInfo.GOP->QueryMode (mDisplayInfo.GOP, ModeIndex, &SizeOfInfo, &ModeInfo);
+        if (EFI_ERROR (Status)) {
+          continue;
+        }
+
+        if ((ModeInfo->PixelFormat == PixelBlueGreenRedReserved8BitPerColor)
+          || (ModeInfo->PixelFormat == PixelRedGreenBlueReserved8BitPerColor)
+          || (ModeInfo->PixelFormat == PixelBitMask)
+          )
+        {
+          Status = mDisplayInfo.GOP->SetMode (mDisplayInfo.GOP, ModeIndex);
+          if (!EFI_ERROR (Status)) {
+            if (mDisplayInfo.GOP->Mode->FrameBufferBase > MAX_UINT32) {
+              PrintDebug (L"Mode %u framebuffer base above 4GB (%lx); trying other modes\n", ModeIndex, mDisplayInfo.GOP->Mode->FrameBufferBase);
+              continue;
+            }
+
+            PrintDebug (L"Switched GOP to mode %u (%ux%u, PixelFormat=%u)\n",
+              ModeIndex, ModeInfo->HorizontalResolution, ModeInfo->VerticalResolution, ModeInfo->PixelFormat);
+            break;
+          }
+        }
+      }
+    }
+
     mDisplayInfo.HorizontalResolution  = mDisplayInfo.GOP->Mode->Info->HorizontalResolution;
     mDisplayInfo.VerticalResolution    = mDisplayInfo.GOP->Mode->Info->VerticalResolution;
     mDisplayInfo.PixelFormat           = mDisplayInfo.GOP->Mode->Info->PixelFormat;
+    mDisplayInfo.PixelInformation      = mDisplayInfo.GOP->Mode->Info->PixelInformation;
     mDisplayInfo.PixelsPerScanLine     = mDisplayInfo.GOP->Mode->Info->PixelsPerScanLine;
     mDisplayInfo.FrameBufferBase       = mDisplayInfo.GOP->Mode->FrameBufferBase;
     // usually = PixelsPerScanLine * VerticalResolution * BytesPerPixel
@@ -74,41 +201,6 @@ InitializeDisplay (
     goto Exit;
   } else {
     PrintDebug (L"GOP display adapter not found\n");
-  }
-
-  //
-  // Try a UGA adapter.
-  //
-  mDisplayInfo.GOP = NULL;
-  Status = gBS->HandleProtocol (gST->ConsoleOutHandle, &gEfiUgaDrawProtocolGuid, (VOID **)&mDisplayInfo.UGA);
-  if (EFI_ERROR (Status)) {
-    Status = gBS->LocateProtocol (&gEfiUgaDrawProtocolGuid, NULL, (VOID **)&mDisplayInfo.UGA);
-  }
-  if (!EFI_ERROR (Status)) {
-    PrintDebug (L"Found a UGA display adapter\n");
-    Status = mDisplayInfo.UGA->GetMode (
-                                  mDisplayInfo.UGA,
-                                  &mDisplayInfo.HorizontalResolution,
-                                  &mDisplayInfo.VerticalResolution,
-                                  &Temp1,
-                                  &Temp2
-                                  );
-    if (EFI_ERROR (Status)) {
-      PrintError (L"Unable to get current UGA mode (error: %r)\n", Status);
-      mDisplayInfo.UGA = NULL;
-      goto Exit;
-    } else {
-      PrintDebug (L"Received current UGA mode information\n");
-    }
-
-    mDisplayInfo.PixelFormat   = PixelBlueGreenRedReserved8BitPerColor; // default for UGA
-    // TODO: find framebuffer base
-    // TODO: find scanline length
-    // https://github.com/coreos/grub/blob/master/grub-core%2Fvideo%2Fefi_uga.c
-    mDisplayInfo.Protocol      = UGA;
-    mDisplayInfo.AdapterFound  = TRUE;
-  } else {
-    PrintDebug (L"UGA display adapter not found\n");
   }
 
   Exit:
@@ -236,6 +328,7 @@ SwitchVideoMode (
   EFI_STATUS                              Status = EFI_DEVICE_ERROR;
   UINT32                                  MaxMode;
   UINT32                                  i;
+  UINT32                                  OriginalMode;
   EFI_GRAPHICS_OUTPUT_MODE_INFORMATION    *ModeInfo;
   UINTN                                   SizeOfInfo;
   BOOLEAN                                 MatchFound = FALSE;
@@ -250,12 +343,13 @@ SwitchVideoMode (
   }
 
   if (mDisplayInfo.Protocol != GOP) {
-    PrintError (L"Video mode switching is not supported on UGA display adapters.\n");
+    PrintError (L"Video mode switching is only supported on GOP.\n");
     return EFI_UNSUPPORTED;
   }
 
   // Try to switch to a desired resolution
   MaxMode = mDisplayInfo.GOP->Mode->MaxMode;
+  OriginalMode = mDisplayInfo.GOP->Mode->Mode;
   for (i = 0; i < MaxMode; i++) {
     Status = mDisplayInfo.GOP->QueryMode (mDisplayInfo.GOP, i, &SizeOfInfo, &ModeInfo);
     if (!EFI_ERROR (Status)) {
@@ -265,6 +359,7 @@ SwitchVideoMode (
       {
         if ((ModeInfo->PixelFormat == PixelBlueGreenRedReserved8BitPerColor)
           || (ModeInfo->PixelFormat == PixelRedGreenBlueReserved8BitPerColor)
+          || (ModeInfo->PixelFormat == PixelBitMask)
           )
         {
           MatchFound = TRUE;
@@ -272,18 +367,30 @@ SwitchVideoMode (
           if (EFI_ERROR (Status)) {
             PrintError (L"Failed to switch to Mode %u with desired %ux%u resolution.\n", i, Width, Height);
           } else {
+            if (mDisplayInfo.GOP->Mode->FrameBufferBase > MAX_UINT32) {
+              PrintDebug (L"Mode %u framebuffer base above 4GB (%lx); trying other modes\n", i, mDisplayInfo.GOP->Mode->FrameBufferBase);
+              continue;
+            }
+
             PrintDebug (L"Set mode %u with desired %ux%u resolution.\n", i, Width, Height);
-            break;
+            goto Exit;
           }
         }
       }
     }
   }
 
+  if (MatchFound) {
+    // Candidates existed but were not usable; restore original mode.
+    (VOID)mDisplayInfo.GOP->SetMode (mDisplayInfo.GOP, OriginalMode);
+  }
+
+Exit:
   // Refresh mDisplayInfo
   mDisplayInfo.HorizontalResolution  = mDisplayInfo.GOP->Mode->Info->HorizontalResolution;
   mDisplayInfo.VerticalResolution    = mDisplayInfo.GOP->Mode->Info->VerticalResolution;
   mDisplayInfo.PixelFormat           = mDisplayInfo.GOP->Mode->Info->PixelFormat;
+  mDisplayInfo.PixelInformation      = mDisplayInfo.GOP->Mode->Info->PixelInformation;
   mDisplayInfo.PixelsPerScanLine     = mDisplayInfo.GOP->Mode->Info->PixelsPerScanLine;
   mDisplayInfo.FrameBufferBase       = mDisplayInfo.GOP->Mode->FrameBufferBase;
   mDisplayInfo.FrameBufferSize       = mDisplayInfo.GOP->Mode->FrameBufferSize;
@@ -325,7 +432,7 @@ ForceVideoModeHack (
   }
 
   if (mDisplayInfo.Protocol != GOP) {
-    PrintError (L"Video mode switching is not supported on UGA display adapters.\n");
+    PrintError (L"Video mode switching is only supported on GOP.\n");
     return EFI_UNSUPPORTED;
   }
 
@@ -334,6 +441,17 @@ ForceVideoModeHack (
   OrigVerticalResolution    = mDisplayInfo.GOP->Mode->Info->VerticalResolution;
   OrigPixelsPerScanLine     = mDisplayInfo.GOP->Mode->Info->PixelsPerScanLine;
   OrigFrameBufferSize       = (UINT32)mDisplayInfo.GOP->Mode->FrameBufferSize;
+
+  if (!mSavedGopMode.Saved) {
+    mSavedGopMode.Saved                = TRUE;
+    mSavedGopMode.Gop                  = mDisplayInfo.GOP;
+    mSavedGopMode.HorizontalResolution = OrigHorizontalResolution;
+    mSavedGopMode.VerticalResolution   = OrigVerticalResolution;
+    mSavedGopMode.PixelFormat          = mDisplayInfo.GOP->Mode->Info->PixelFormat;
+    mSavedGopMode.PixelInformation     = mDisplayInfo.GOP->Mode->Info->PixelInformation;
+    mSavedGopMode.PixelsPerScanLine    = OrigPixelsPerScanLine;
+    mSavedGopMode.FrameBufferSize      = mDisplayInfo.GOP->Mode->FrameBufferSize;
+  }
 
   NewHorizontalResolution   = (UINT32)Width;
   NewVerticalResolution     = (UINT32)Height;
@@ -344,6 +462,12 @@ ForceVideoModeHack (
 
   NewPixelsPerScanLine      = OrigPixelsPerScanLine * ScanlineScale; // Should be bigger than HorizontalResolution
   NewFrameBufferSize        = NewPixelsPerScanLine * NewVerticalResolution * 4; // PixelsPerScanLine * VerticalResolution * 4
+
+  if (NewFrameBufferSize > OrigFrameBufferSize) {
+    PrintError (L"ForceVideoModeHack aborted: computed framebuffer size %u exceeds reported size %u\n",
+      NewFrameBufferSize, OrigFrameBufferSize);
+    return EFI_UNSUPPORTED;
+  }
 
   mDisplayInfo.GOP->Mode->Info->HorizontalResolution = NewHorizontalResolution;
   mDisplayInfo.GOP->Mode->Info->VerticalResolution   = NewVerticalResolution;
@@ -356,6 +480,7 @@ ForceVideoModeHack (
   mDisplayInfo.HorizontalResolution  = mDisplayInfo.GOP->Mode->Info->HorizontalResolution;
   mDisplayInfo.VerticalResolution    = mDisplayInfo.GOP->Mode->Info->VerticalResolution;
   mDisplayInfo.PixelFormat           = mDisplayInfo.GOP->Mode->Info->PixelFormat;
+  mDisplayInfo.PixelInformation      = mDisplayInfo.GOP->Mode->Info->PixelInformation;
   mDisplayInfo.PixelsPerScanLine     = mDisplayInfo.GOP->Mode->Info->PixelsPerScanLine;
   mDisplayInfo.FrameBufferBase       = mDisplayInfo.GOP->Mode->FrameBufferBase;
   mDisplayInfo.FrameBufferSize       = mDisplayInfo.GOP->Mode->FrameBufferSize;
@@ -390,7 +515,14 @@ PrintVideoInfo (
   PrintDebug (L"Current mode:\n");
   PrintDebug (L"  HorizontalResolution = %u\n", mDisplayInfo.HorizontalResolution);
   PrintDebug (L"  VerticalResolution = %u\n", mDisplayInfo.VerticalResolution);
-  PrintDebug (L"  PixelFormat = %u\n", mDisplayInfo.PixelFormat);
+  PrintDebug (L"  PixelFormat = %u (%s)\n", mDisplayInfo.PixelFormat, PixelFormatToStr (mDisplayInfo.PixelFormat));
+  if (mDisplayInfo.PixelFormat == PixelBitMask) {
+    PrintDebug (L"  PixelMask R=%08x G=%08x B=%08x X=%08x\n",
+      mDisplayInfo.PixelInformation.RedMask,
+      mDisplayInfo.PixelInformation.GreenMask,
+      mDisplayInfo.PixelInformation.BlueMask,
+      mDisplayInfo.PixelInformation.ReservedMask);
+  }
   PrintDebug (L"  PixelsPerScanLine = %u\n", mDisplayInfo.PixelsPerScanLine);
   PrintDebug (L"  FrameBufferBase = %x\n", mDisplayInfo.FrameBufferBase);
   PrintDebug (L"  FrameBufferSize = %u\n", mDisplayInfo.FrameBufferSize);
@@ -402,7 +534,19 @@ PrintVideoInfo (
     for (i = 0; i < MaxMode; i++) {
       Status = mDisplayInfo.GOP->QueryMode (mDisplayInfo.GOP, i, &SizeOfInfo, &ModeInfo);
       if (!EFI_ERROR (Status)) {
-        PrintDebug (L"  Mode%u: %ux%u\n", i, ModeInfo->HorizontalResolution, ModeInfo->VerticalResolution);
+        PrintDebug (L"  Mode%u: %ux%u PixelFormat=%u (%s)\n",
+          i,
+          ModeInfo->HorizontalResolution,
+          ModeInfo->VerticalResolution,
+          ModeInfo->PixelFormat,
+          PixelFormatToStr (ModeInfo->PixelFormat));
+        if (ModeInfo->PixelFormat == PixelBitMask) {
+          PrintDebug (L"    Mask R=%08x G=%08x B=%08x X=%08x\n",
+            ModeInfo->PixelInformation.RedMask,
+            ModeInfo->PixelInformation.GreenMask,
+            ModeInfo->PixelInformation.BlueMask,
+            ModeInfo->PixelInformation.ReservedMask);
+        }
       }
     }
   }
@@ -465,7 +609,7 @@ CreateImage (
 
   Image->Width      = Width;
   Image->Height     = Height;
-  Image->PixelData  = (EFI_UGA_PIXEL *)AllocateZeroPool (Width * Height * sizeof (EFI_UGA_PIXEL));
+  Image->PixelData  = (EFI_GRAPHICS_OUTPUT_BLT_PIXEL *)AllocateZeroPool (Width * Height * sizeof (EFI_GRAPHICS_OUTPUT_BLT_PIXEL));
   if (Image->PixelData == NULL) {
     DestroyImage (Image);
     return NULL;
@@ -528,7 +672,7 @@ BmpFileToImage (
   UINT8           *BmpCurrentPixel;
   UINT8           *BmpCurrentLine;
   UINTN           LineSizeBytes;
-  EFI_UGA_PIXEL   *TargetPixel;
+  EFI_GRAPHICS_OUTPUT_BLT_PIXEL   *TargetPixel;
   UINTN           x;
   UINTN           y;
 
@@ -607,9 +751,9 @@ ClearScreen (
   VOID
   )
 {
-  EFI_UGA_PIXEL   FillColor;
+  EFI_GRAPHICS_OUTPUT_BLT_PIXEL   FillColor;
 
-  ZeroMem (&FillColor, sizeof (EFI_UGA_PIXEL));
+  ZeroMem (&FillColor, sizeof (EFI_GRAPHICS_OUTPUT_BLT_PIXEL));
 
   if (EFI_ERROR (EnsureDisplayAvailable ())) {
     PrintDebug (L"No display adapters found, unable to clear screen\n");
@@ -618,23 +762,13 @@ ClearScreen (
 
   SwitchToGraphics (FALSE);
 
-  if (mDisplayInfo.Protocol == GOP) {
-    mDisplayInfo.GOP->Blt (
-                        mDisplayInfo.GOP,
-                        (EFI_GRAPHICS_OUTPUT_BLT_PIXEL *)&FillColor,
-                        EfiBltVideoFill,
-                        0, 0, 0, 0,
-                        mDisplayInfo.HorizontalResolution, mDisplayInfo.VerticalResolution, 0
-                        );
-  } else if (mDisplayInfo.Protocol == UGA) {
-    mDisplayInfo.UGA->Blt (
-                        mDisplayInfo.UGA,
-                        &FillColor,
-                        EfiUgaVideoFill,
-                        0, 0, 0, 0,
-                        mDisplayInfo.HorizontalResolution, mDisplayInfo.VerticalResolution, 0
-                        );
-  }
+  mDisplayInfo.GOP->Blt (
+                      mDisplayInfo.GOP,
+                      &FillColor,
+                      EfiBltVideoFill,
+                      0, 0, 0, 0,
+                      mDisplayInfo.HorizontalResolution, mDisplayInfo.VerticalResolution, 0
+                      );
 }
 
 
@@ -668,23 +802,13 @@ DrawImage (
 
   SwitchToGraphics (FALSE);
 
-  if (mDisplayInfo.Protocol == GOP) {
-    mDisplayInfo.GOP->Blt (
-                        mDisplayInfo.GOP,
-                        (EFI_GRAPHICS_OUTPUT_BLT_PIXEL *)Image->PixelData,
-                        EfiBltBufferToVideo,
-                        SpriteX, SpriteY, ScreenX, ScreenY,
-                        DrawWidth, DrawHeight, 0
-                        );
-  } else if (mDisplayInfo.Protocol == UGA) {
-    mDisplayInfo.UGA->Blt (
-                        mDisplayInfo.UGA,
-                        (EFI_UGA_PIXEL *)Image->PixelData,
-                        EfiUgaBltBufferToVideo,
-                        SpriteX, SpriteY, ScreenX, ScreenY,
-                        DrawWidth, DrawHeight, 0
-                        );
-  }
+  mDisplayInfo.GOP->Blt (
+                      mDisplayInfo.GOP,
+                      (EFI_GRAPHICS_OUTPUT_BLT_PIXEL *)Image->PixelData,
+                      EfiBltBufferToVideo,
+                      SpriteX, SpriteY, ScreenX, ScreenY,
+                      DrawWidth, DrawHeight, 0
+                      );
 }
 
 
