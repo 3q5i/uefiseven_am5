@@ -61,7 +61,7 @@ Removed UGA support (headers weren’t available), standardized on GOP paths.
 Fixed Int10hHandler.sh so it doesn’t depend on todos being installed.
 
 ## Credits
+* Original UefiSeven project
 * Original VgaShim project
 * OVMF project
 * EDK II project
-- Original UefiSeven project
